@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <unordered_map>
 #include <iostream>
+#include <future>
 
 using namespace std;
 
@@ -30,130 +31,31 @@ enum ThreadMode
 	FIXED
 };
 
-class Task
-{
-public:
-	Task();
-	~Task();
-
-	void setResult(Result *res);
-	void exec();
-	virtual Any run() = 0;
-
-	Result *res_;
-};
-/* examples
-
-	Any a(1);
-	std::cout << a.cast_<int>();
-
-*/
-class Any
-{
-public:
-	Any() = default;
-	~Any() = default;
-	Any(const Any &v) = delete;
-	Any &operator=(const Any &v) = delete;
-	Any(Any &&) = default;
-	Any &operator=(Any &&) = default;
-
-	template <typename T>
-	Any(T v) : data(std::make_unique<Derived<T>>(v)) {}
-
-	template <typename T>
-	T cast_()
-	{
-		Derived<T> *derived = dynamic_cast<Derived<T> *>(data.get());
-
-		return derived->val_;
-	}
-
-private:
-	class Base
-	{
-	public:
-		virtual ~Base() = default;
-	};
-
-	template <typename T>
-	class Derived : public Base
-	{
-	public:
-		Derived(T val) : val_(val)
-		{
-		}
-		~Derived()
-		{
-		}
-
-		T val_;
-	};
-
-	std::unique_ptr<Base> data;
-};
-
-class Semaphore
-{
-private:
-	std::atomic_int val_;
-	std::mutex mtx_;
-	std::condition_variable cond_;
-
-public:
-	Semaphore() : val_(int(0)) {}
-	Semaphore(int val) : val_(val) {}
-
-	void wait()
-	{
-		std::unique_lock<std::mutex> lock(mtx_);
-		cond_.wait(lock, [&]()
-				   { return val_ > 0; });
-		val_--;
-		if (val_ > 0)
-			cond_.notify_all();
-	}
-
-	void post()
-	{
-		std::unique_lock<std::mutex> lock(mtx_);
-		val_++;
-		cond_.notify_all();
-	}
-};
-
-class Result
-{
-public:
-	Result(const std::shared_ptr<Task> task, bool isValid = true) : task_(task), isValid_(isValid)
-	{
-		task_->setResult(this);
-	}
-
-	~Result() {}
-
-	Result(const Result &) {};
-	void setVal(Any val);
-	Any get();
-
-private:
-	Any val_;
-	bool isValid_;
-	Semaphore sem_;
-	std::shared_ptr<Task> task_;
-};
-
 class Thread
 {
 
 public:
 	using Func = std::function<void(int)>;
 
-	Thread(Func f);
-	~Thread();
+	Thread(Func f) : id(threadId++)
+	{
+		this->f = f;
+	}
 
-	void start();
-	int getId();
+	~Thread()
+	{
+	}
+
+	void start()
+	{
+		std::thread t(this->f, id);
+		t.detach();
+	}
+
+	int getId()
+	{
+		return id;
+	}
 
 private:
 	Func f;
@@ -161,25 +63,212 @@ private:
 	static int threadId;
 };
 
+int Thread::threadId = 0;
+
 class ThreadPool
 {
 
 public:
-	ThreadPool();
-	~ThreadPool();
+	ThreadPool() : threadPoolIsRunning_(false),
+				   mode_(ThreadMode::FIXED),
+				   threadsQueSizeThreshold_(16),
+				   initThreadSize_(5),
+				   currentThreadSize_(5),
+				   idleThreadsSize_(0),
+				   taskQueSizeThreshold_(MAX_TASK_NUM),
+				   currentTaskSize_(0)
+	{
+	}
+
+	~ThreadPool()
+	{
+		this->threadPoolIsRunning_ = false;
+		std::unique_lock<std::mutex> lock(this->taskQueMtx);
+		taskQueNotEmpty.notify_all();
+		conExit_.wait(lock, [&]() -> bool
+					  { return threadsMap_.size() == 0; });
+	}
 
 	ThreadPool(const ThreadPool &) = delete;
 	ThreadPool &operator=(const ThreadPool &) = delete;
 
-	void setMode(ThreadMode mode);
-	bool checkThreadPoolIsRunning();
-	Result submitTask(std::shared_ptr<Task> task);
-	void start(int threadTask = std::thread::hardware_concurrency());
-	void setTaskQueThreshold(int taskQueThreshold = MAX_TASK_NUM);
-	void setTaskQueCurrentSize(int currentTaskSize);
-	void setThreadsQueThreshold(int threadsThreshold);
-	void setThreadQueCurrentSize(int currentThreadSize);
-	void threadHandler(int threadId);
+	void setMode(ThreadMode mode)
+	{
+		mode_ = mode;
+	}
+
+	bool checkThreadPoolIsRunning()
+	{
+		return threadPoolIsRunning_;
+	}
+
+	void setTaskQueThreshold(int taskQueSizeThreshold = MAX_TASK_NUM)
+	{
+		if (!checkThreadPoolIsRunning())
+			this->taskQueSizeThreshold_ = taskQueSizeThreshold;
+	}
+
+	void setTaskQueCurrentSize(int currentTasksSize)
+	{
+		if (!checkThreadPoolIsRunning())
+			this->currentTaskSize_ = currentTasksSize;
+	}
+
+	void setThreadsQueThreshold(int threadsQueSizeThreshold)
+	{
+		if (!checkThreadPoolIsRunning())
+			this->threadsQueSizeThreshold_ = threadsQueSizeThreshold;
+	}
+
+	void setThreadQueCurrentSize(int currentThreadsSize)
+	{
+		if (!checkThreadPoolIsRunning())
+			this->currentThreadSize_ = currentThreadsSize;
+	}
+
+	void start(int threadSize = std::thread::hardware_concurrency())
+	{
+		this->threadPoolIsRunning_ = true;
+
+		this->initThreadSize_ = threadSize;
+		this->currentThreadSize_ = threadSize;
+
+		for (int i = 0; i < this->currentThreadSize_; i++)
+		{
+
+			auto f = std::bind(&ThreadPool::threadHandler, this, std::placeholders::_1);
+
+			std::unique_ptr<Thread> ptr = std::make_unique<Thread>(f);
+
+			this->threadsMap_.emplace(ptr->getId(), std::move(ptr));
+		}
+
+		for (int i = 0; i < this->currentThreadSize_; i++)
+		{
+			this->threadsMap_[i]->start();
+			this->idleThreadsSize_++;
+		}
+	}
+
+	// 可变参模板编程，让函数接收任意任务函数和任意数量参数
+	template <typename Func, typename... Args>
+	auto submitTask(Func &&func, Args &&...args) -> std::future<decltype(func(args...))>
+	{
+		using RType = decltype(func(args...));
+		auto task = std::make_shared<std::packaged_task<RType()>>(
+			std::bind(std::forward<Func>(func), std::forward<Args>(args)...));
+
+		std::future<RType> result = task->get_future();
+
+		std::cout << "Submit Task" << std::endl;
+
+		std::unique_lock<std::mutex> lock(this->taskQueMtx);
+
+		if (!this->taskQueNotFull.wait_for(lock, std::chrono::seconds(1), [&]() -> bool
+										   { return (this->currentTaskSize_ < this->taskQueSizeThreshold_); }))
+		{
+			std::cout << "Task Queue Is Full" << endl;
+			auto task = std::make_shared<std::packaged_task<RType()>>([]() -> RType
+																	  { return RType(); });
+			(*task)();
+
+			return task->get_future();
+		}
+
+		// 加入中间层，在void()中执行task()
+		auto taskWrapper = std::make_shared<Task>([task]()
+												  { (*task)(); });
+		tasksQue_.emplace(taskWrapper);
+
+		currentTaskSize_++;
+		this->taskQueNotEmpty.notify_all();
+
+		if (mode_ == ThreadMode::CACHED)
+		{
+			if (this->currentTaskSize_ > this->idleThreadsSize_ &&
+				this->currentThreadSize_ < this->threadsQueSizeThreshold_)
+			{
+
+				auto f = std::bind(&ThreadPool::threadHandler, this, std::placeholders::_1);
+
+				std::unique_ptr<Thread> ptr = std::make_unique<Thread>(f);
+				int id = ptr->getId();
+
+				this->threadsMap_.emplace(id, std::move(ptr));
+
+				this->threadsMap_[id]->start();
+				this->currentThreadSize_++;
+				this->idleThreadsSize_++;
+			}
+		}
+
+		return result;
+	}
+
+	void threadHandler(int threadId)
+	{
+		// std::chrono::time_point last = std::chrono::system_clock::now();
+		auto last = std::chrono::system_clock::now();
+
+		for (;;)
+		{
+			shared_ptr<Task> task;
+			{
+				std::cout << "Thread " << threadId << std::endl;
+
+				std::unique_lock<std::mutex> lock(this->taskQueMtx);
+
+				while (currentTaskSize_ == 0)
+				{
+					if (!threadPoolIsRunning_)
+					{
+						std::cout << "Thread  " << threadId << "exit!!!";
+						threadsMap_.erase(threadId);
+						conExit_.notify_all();
+						return;
+					}
+
+					if (this->mode_ == ThreadMode::CACHED)
+					{
+
+						if (std::cv_status::timeout == taskQueNotEmpty.wait_for(lock, std::chrono::seconds(1)))
+						{
+							auto duration = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now() - last);
+							if (duration.count() > THREAD_IDLE_DURATION && currentThreadSize_ > this->initThreadSize_)
+							{
+								std::cout << "Thread  " << threadId << "exit!!!";
+								threadsMap_.erase(threadId);
+								this->currentThreadSize_--;
+								this->idleThreadsSize_--;
+
+								return;
+							}
+						}
+					}
+					else
+					{
+						taskQueNotEmpty.wait(lock);
+					}
+				}
+
+				task = this->tasksQue_.front();
+				this->tasksQue_.pop();
+				this->currentTaskSize_--;
+				this->idleThreadsSize_--;
+
+				if (this->currentTaskSize_ > 0)
+					taskQueNotEmpty.notify_all();
+				taskQueNotFull.notify_all();
+			}
+			std::cout << "Thread " << threadId << std::endl;
+
+			if (task != nullptr)
+				(*task)();
+
+			this->idleThreadsSize_++;
+			last = std::chrono::system_clock::now();
+		}
+	}
 
 private:
 	ThreadMode mode_;
@@ -191,6 +280,7 @@ private:
 	int threadsQueSizeThreshold_;
 	int idleThreadsSize_;
 
+	using Task = function<void()>;
 	std::queue<std::shared_ptr<Task>> tasksQue_;
 	std::atomic_int currentTaskSize_;
 	int taskQueSizeThreshold_;
